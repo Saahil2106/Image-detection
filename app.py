@@ -87,6 +87,44 @@ def run_analysis(filepath: str, model_slot: str = 'default') -> dict:
     # Switch model slot if requested
     if model_slot != "default":
         trainer.set_model_slot(model_slot)
+
+    # Auto-fallback: if selected slot has no model, find the best available slot.
+    # "Best" = has a model file, correct feature count (302), most training samples.
+    if not trainer.MODEL_FILE.exists():
+        available = trainer.list_model_slots()
+        best = None
+        best_samples = -1
+        for slot_name, slot_dir in available:
+            clf = slot_dir / "classifier.joblib"
+            meta_f = slot_dir / "meta.json"
+            if not clf.exists():
+                continue
+            # Check feature count from meta.json — skip stale models
+            if meta_f.exists():
+                import json as _json
+                try:
+                    m = _json.load(open(meta_f))
+                    n_feat = m.get("n_features_expected", 0)
+                    if n_feat not in (0, 302):   # 0 = old meta without field, accept it
+                        print(f"  [AUTO-SLOT] Skipping '{slot_name}' — stale ({n_feat} features)")
+                        continue
+                    n_samp = m.get("n_samples", 0)
+                    if n_samp > best_samples:
+                        best_samples = n_samp
+                        best = slot_name
+                except Exception:
+                    pass
+            else:
+                best = slot_name  # no meta, try anyway
+        if best:
+            trainer.set_model_slot(best)
+            print(f"  [AUTO-SLOT] Using slot '{best}' ({best_samples} samples)")
+            model_slot = best
+        elif available:
+            # Last resort — just use first available
+            trainer.set_model_slot(available[0][0])
+            model_slot = available[0][0]
+
     result["model_slot"] = model_slot
 
     try:
@@ -148,8 +186,15 @@ def run_analysis(filepath: str, model_slot: str = 'default') -> dict:
         rb_ai = float(report.ai_probability)
 
         # ── Stage 3: ML model (only if ambiguous) ──────────────────
-        # Find model dir -- check script location, parent, and D:\Coding
+        # Respect the active model slot set by set_model_slot() above.
+        # MODEL_FILE is a module-level global in trainer that set_model_slot updates.
+        # Fall back to scanning candidate dirs only if the slot path doesn't exist.
         def _find_model_dir():
+            # First: use whatever slot was activated (trainer.MODEL_FILE is authoritative)
+            slot_dir = trainer.MODEL_FILE.parent
+            if (slot_dir / "classifier.joblib").exists():
+                return slot_dir
+            # Fallback: scan standard locations for default slot
             candidates = [
                 SCRIPT_DIR / "model",
                 SCRIPT_DIR.parent / "model",
@@ -164,13 +209,36 @@ def run_analysis(filepath: str, model_slot: str = 'default') -> dict:
         model_file = found_model_dir / "classifier.joblib"
         ml_data    = None
 
-        if model_file.exists() and 0.30 <= rb_ai <= 0.70:
+        model_exists  = model_file.exists()
+        # Widened gate: 0.18-0.82 (was 0.25-0.75)
+        # Catches images like photorealistic AI PNGs that forensics scores too low (18-25%)
+        # ML model trained on GenImage/Wukong will correctly identify these
+        stage2_ambiguous = 0.18 <= rb_ai <= 0.82
+
+        if model_exists and stage2_ambiguous:
             vec = trainer.extract_feature_vector(filepath, analyzer)
             if vec is not None:
                 hc_vec, cnn_vec = trainer.split_feature_vector(vec)
                 pipeline  = joblib.load(model_file)
                 meta      = json.load(open(found_model_dir / "meta.json"))
                 hc_auc    = meta.get("cv_auc_mean", 0.5)
+
+                # Guard: check feature dimension matches what model was trained on
+                n_expected = meta.get("n_features_expected", None)
+                if n_expected and hc_vec.shape[0] != n_expected:
+                    print(f"  [WARN] Model expects {n_expected} features but got {hc_vec.shape[0]}.")
+                    print(f"  [WARN] Model is stale — retrain with --clear-cache --train.")
+                    ml_data = {"stage_skipped": True,
+                               "skip_reason": f"Model stale: expects {n_expected} features, got {hc_vec.shape[0]}. Run --clear-cache --train."}
+                    result["ml"] = ml_data
+                    final_ai = rb_ai * 100
+                    auth_score = int(100 - final_ai)
+                    verdict = "AI" if final_ai > 45 else ("UNCERTAIN" if final_ai > 30 else "REAL")
+                    result["final"] = {"verdict": verdict, "ai_prob": round(final_ai, 1),
+                                        "score": auth_score, "source": "forensic",
+                                        "note": "ML skipped: model stale, needs retraining"}
+                    return result
+
                 rf_probas = pipeline.predict_proba(hc_vec.reshape(1, -1))[0]
                 rf_prob   = float(rf_probas[1])
 
@@ -190,10 +258,20 @@ def run_analysis(filepath: str, model_slot: str = 'default') -> dict:
                     blended, cnn_cal, disagree, uncertain = trainer._blend_predictions(
                         rf_prob, cnn_ai_raw, hc_auc, cnn_auc)
 
-                    # If forensic says AI but CNN says real, CNN is likely miscalibrated
-                    if rf_prob > 0.45 and cnn_cal < 0.40:
-                        blended   = 0.85 * rf_prob + 0.15 * cnn_cal
-                        uncertain = True
+                    # Override for opposite-verdict cases — RF and CNN on opposite sides of 50%
+                    # _blend_predictions handles this now, but apply extra guard here too
+                    # Case 1: RF says real (<20%), CNN says AI (>60%) — trust RF
+                    # Case 2: RF says AI (>70%), CNN says real (<25%) — trust RF
+                    rf_says_real = rf_prob < 0.20
+                    rf_says_ai   = rf_prob > 0.70
+                    cnn_says_ai  = cnn_cal > 0.60
+                    cnn_says_real= cnn_cal < 0.25
+                    if (rf_says_real and cnn_says_ai) or (rf_says_ai and cnn_says_real):
+                        blended   = 0.92 * rf_prob + 0.08 * cnn_cal
+                        uncertain = (0.30 < blended < 0.45)
+                    elif rf_prob > 0.40 and cnn_cal < 0.45:
+                        blended   = 0.90 * rf_prob + 0.10 * cnn_cal
+                        uncertain = (0.30 < blended < 0.45)
 
                     cnn_prob_raw = round(cnn_ai_raw * 100, 1)
                     cnn_prob_cal = round(cnn_cal    * 100, 1)
@@ -208,9 +286,17 @@ def run_analysis(filepath: str, model_slot: str = 'default') -> dict:
                     "rf_auc":       round(hc_auc, 3),
                     "stage_skipped": False,
                 }
-        elif model_file.exists():
+        elif not stage2_ambiguous:
+            # Stage 2 gave a clear verdict — ML not needed regardless of model presence
+            if rb_ai < 0.18:
+                skip_reason = f"Stage 2 clear — {rb_ai*100:.0f}% AI (clearly real, ML not needed)"
+            else:
+                skip_reason = f"Stage 2 clear — {rb_ai*100:.0f}% AI (clearly AI, ML not needed)"
+            ml_data = {"stage_skipped": True, "skip_reason": skip_reason}
+        elif not model_exists:
+            # Stage 2 was ambiguous but no model trained yet
             ml_data = {"stage_skipped": True,
-                       "skip_reason": f"Stage 2 clear ({rb_ai*100:.0f}% AI)"}
+                       "skip_reason": "No trained model — run: py -3.12 image_trainer.py --train"}
 
         result["ml"] = ml_data
 
@@ -221,9 +307,9 @@ def run_analysis(filepath: str, model_slot: str = 'default') -> dict:
             final_ai = rb_ai * 100
 
         auth_score = int(100 - final_ai)
-        if final_ai > 55:
+        if final_ai > 45:
             verdict = "AI"
-        elif final_ai > 35:
+        elif final_ai > 30:
             verdict = "UNCERTAIN"
         else:
             verdict = "REAL"
@@ -860,8 +946,13 @@ async function loadModelSlots() {
       container.appendChild(btn);
     });
 
-    const first = slots[0];
-    hint.textContent = `n=${first.n_samples||'?'}  RF AUC=${first.rf_auc ? first.rf_auc.toFixed(3) : '?'}${first.has_cnn ? ' + CNN' : ''}`;
+    // Auto-select first slot that has a trained model
+    const trainedSlot = slots[0];
+    activeSlot = trainedSlot.slot;
+    container.querySelectorAll('.slot-btn').forEach(b => {
+      b.classList.toggle('active', b.dataset.slot === activeSlot);
+    });
+    hint.textContent = `n=${trainedSlot.n_samples||'?'}  RF AUC=${trainedSlot.rf_auc ? trainedSlot.rf_auc.toFixed(3) : '?'}${trainedSlot.has_cnn ? ' + CNN' : ''}  [auto-selected]`;
   } catch(e) {
     document.getElementById('model-hint').textContent = 'Could not load slots';
   }
@@ -1018,9 +1109,11 @@ function renderResults(data) {
     `AI prob: <span class="val">${forensic.ai_prob}%</span><br>Auth score: <span class="val">${forensic.auth_score}/100</span>`;
 
   const mlSkipped = ml && ml.stage_skipped;
-  const mlResult = !ml ? '<span class="val">No model loaded</span>' :
-    mlSkipped ? `<span class="val">Skipped</span><br><span style="font-size:0.68rem">${ml.skip_reason}</span>` :
-    `RF: <span class="val">${ml.rf_prob}%</span>&nbsp; CNN: <span class="val">${ml.cnn_prob_cal ?? '—'}%</span><br>Blended: <span class="val">${ml.blended}%</span>${ml.uncertain ? '<br><span style="color:var(--warn)">⚠ Models disagree</span>' : ''}`;
+  const mlResult = !ml
+    ? '<span style="color:var(--warn)">No model found — run --train first</span>'
+    : mlSkipped
+      ? `<span style="color:var(--muted);font-size:0.82rem">Not needed</span><br><span style="font-size:0.72rem;color:var(--muted)">${ml.skip_reason}</span>`
+      : `RF: <span class="val">${ml.rf_prob}%</span>&nbsp; CNN: <span class="val">${ml.cnn_prob_cal ?? '—'}%</span><br>Blended: <span class="val">${ml.blended}%</span>${ml.uncertain ? '<br><span style="color:var(--warn)">⚠ Models disagree</span>' : ''}`;
 
   html += `
   <div class="pipeline fade-up-2">
